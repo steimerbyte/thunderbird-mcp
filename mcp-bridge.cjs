@@ -690,12 +690,28 @@ function discoverConnectionInfo(options = {}) {
 }
 
 // Max raw bytes for an attachment read from a path before base64 encoding.
-// Encoded size grows ~33%, so 18 MB raw → ~24 MB base64, staying under the
-// extension's 25 MB MAX_BASE64_SIZE limit.
-const MAX_ATTACHMENT_BYTES = 18 * 1024 * 1024;
+// Matches the extension's per-file cap: 4*ceil(n/3) = 34911580 base64 bytes for
+// the largest file that still fits Gmail's advertised 35882577-byte message.
+const MAX_ATTACHMENT_BYTES = 26183685;
 // Keep these message-wide limits in sync with extension/mcp_server/api.js.
-const MAX_TOTAL_ATTACHMENT_BYTES = 50 * 1024 * 1024;
+// Gmail advertises 250-SIZE 35882577 at EHLO and counts the stored message:
+// base64 body + 72-column wrapping + headers, never the decoded attachment.
+const MAX_STORED_MESSAGE_BYTES = 35882577;
+const MAX_STORED_MESSAGE_HEADER_BYTES = 1228;
+const MAX_STORED_MESSAGE_BASE64_COLUMNS = 72;
 const MAX_ATTACHMENTS_PER_MESSAGE = 20;
+
+// Stored size of an attached body: base64 plus 72-column CRLF wrapping.
+// Mirrors getStoredAttachmentBytes/getStoredEncodedBytes in api.js.
+function getStoredEncodedBytes(encodedBytes) {
+  const encoded = Number.isSafeInteger(encodedBytes) && encodedBytes > 0 ? encodedBytes : 0;
+  return encoded + 2 * Math.ceil(encoded / MAX_STORED_MESSAGE_BASE64_COLUMNS);
+}
+
+function getStoredAttachmentBytes(attachmentBytes) {
+  const decoded = Number.isSafeInteger(attachmentBytes) && attachmentBytes > 0 ? attachmentBytes : 0;
+  return getStoredEncodedBytes(4 * Math.ceil(decoded / 3));
+}
 
 // BEGIN BRIDGE ATTACHMENT POLICY
 // File paths that an MCP caller must never be allowed to attach to outbound
@@ -910,7 +926,13 @@ function guessContentType(filePath) {
 
 function attachmentError(action, filePath, error) {
   if (error?.code === 'ENOENT') {
-    return new Error(`Attachment not found: ${filePath}`, { cause: error });
+    // In a container or sandbox deployment the bridge's filesystem is not the
+    // caller's. Name that, and both ways to still attach the file.
+    return new Error(
+      `Attachment not found: ${filePath} (this server resolves paths in its own filesystem, ` +
+      'so in a container or sandbox deployment stage the file under a shared directory or send inline base64)',
+      { cause: error }
+    );
   }
   if (error?.code === 'EACCES' || error?.code === 'EPERM') {
     return new Error(`Attachment unreadable (permission denied): ${filePath}`, { cause: error });
@@ -1094,6 +1116,35 @@ async function readAttachmentFromPath(fileInfo, context) {
   }
 }
 
+// Field-named validation for an inline attachment object forwarded to the
+// extension. Returns "" when usable, else one single-line refusal naming the
+// field and 1-based entry index. Kept in sync with api.js getInlineAttachmentError.
+function getInlineAttachmentError(entry, index) {
+  const label = `Attachment ${index + 1}`;
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+    const kind = entry === null ? 'null' : Array.isArray(entry) ? 'array' : typeof entry;
+    return `${label} rejected: ${kind} is not a file path string or an inline {name, base64} object`;
+  }
+  if (typeof entry.name !== 'string' || !entry.name.trim()) {
+    return `${label} rejected: name must be a non-empty string`;
+  }
+  if (entry.contentType !== undefined && entry.contentType !== null &&
+      (typeof entry.contentType !== 'string' || !entry.contentType.trim())) {
+    return `${label} rejected: contentType must be a non-empty string when supplied`;
+  }
+  // Mirror the extension's `entry.base64 || entry.content` precedence, so the
+  // reported field is the one that would actually be decoded.
+  const field = entry.base64 ? 'base64' : entry.content ? 'content' : null;
+  if (field) {
+    return typeof entry[field] === 'string' ? '' : `${label} rejected: ${field} must be a base64 string`;
+  }
+  const supplied = entry.base64 !== undefined && entry.base64 !== null ? 'base64'
+    : entry.content !== undefined && entry.content !== null ? 'content' : null;
+  return supplied
+    ? `${label} rejected: ${supplied} is empty`
+    : `${label} rejected: base64 is required for an inline attachment`;
+}
+
 // Replace every string entry in `args.attachments` (= file path) with an
 // inline { name, contentType, base64 } object read off the host filesystem.
 // Inline objects pass through unchanged. All paths and message-wide limits are
@@ -1124,26 +1175,52 @@ async function inlineAttachmentPaths(args, options = {}) {
 
   const fileInfoByIndex = new Map();
   const refused = [];
-  let totalAttachmentBytes = 0;
+  let totalStoredBytes = 0;
   for (let index = 0; index < args.attachments.length; index++) {
     const entry = args.attachments[index];
-    if (typeof entry !== 'string') continue;
+    if (typeof entry !== 'string') {
+      // An inline object is forwarded as-is, so a malformed one would only be
+      // refused later by the extension. Name the field here as well.
+      const inlineError = getInlineAttachmentError(entry, index);
+      if (inlineError) refused.push(inlineError);
+      else if (typeof entry.base64 === 'string') totalStoredBytes += getStoredEncodedBytes(entry.base64.length);
+      else if (typeof entry.content === 'string') totalStoredBytes += getStoredEncodedBytes(entry.content.length);
+      continue;
+    }
 
     try {
-      const fileInfo = await inspectAttachmentPath(entry, context);
-      if (fileInfo.stat.size > MAX_TOTAL_ATTACHMENT_BYTES - totalAttachmentBytes) {
+      if (!entry || entry.trim().startsWith('{') || entry.trim().startsWith('[')) {
         throw new Error(
-          `Attachment aggregate too large at ${entry}: exceeds the ` +
-          `${MAX_TOTAL_ATTACHMENT_BYTES / 1024 / 1024} MB aggregate attachment limit`
+          `Attachment ${index + 1} rejected: string looks like JSON; pass attachments as an array ` +
+          'of paths or inline {name, base64} objects, not a JSON-encoded string'
         );
       }
-      totalAttachmentBytes += fileInfo.stat.size;
+      const fileInfo = await inspectAttachmentPath(entry, context);
+      // The provider counts the stored base64 body, not the raw file bytes.
+      const storedSize = getStoredAttachmentBytes(fileInfo.stat.size);
+      if (totalStoredBytes + storedSize + MAX_STORED_MESSAGE_HEADER_BYTES > MAX_STORED_MESSAGE_BYTES) {
+        throw new Error(
+          `Attachment aggregate too large at ${entry}: stored message size ` +
+          `${totalStoredBytes + storedSize + MAX_STORED_MESSAGE_HEADER_BYTES} bytes ` +
+          '(base64 body + 72-column wrapping + headers) exceeds the ' +
+          `${MAX_STORED_MESSAGE_BYTES} byte limit the mail provider advertises (Gmail 250-SIZE)`
+        );
+      }
+      totalStoredBytes += storedSize;
       fileInfoByIndex.set(index, fileInfo);
     } catch (error) {
       refused.push(error.message);
     }
   }
   if (refused.length) throw new Error(`Attachments refused: ${refused.join('; ')}`);
+  // Inline-only calls never reach the per-path check above.
+  if (totalStoredBytes + MAX_STORED_MESSAGE_HEADER_BYTES > MAX_STORED_MESSAGE_BYTES) {
+    throw new Error(
+      `Attachments refused: stored message size ${totalStoredBytes + MAX_STORED_MESSAGE_HEADER_BYTES} bytes ` +
+      '(base64 body + 72-column wrapping + headers) exceeds the ' +
+      `${MAX_STORED_MESSAGE_BYTES} byte limit the mail provider advertises (Gmail 250-SIZE)`
+    );
+  }
 
   const resolved = [];
   for (let index = 0; index < args.attachments.length; index++) {
@@ -1681,7 +1758,7 @@ module.exports = {
   ATTACHMENT_TOOLS,
   attachmentLimits: {
     MAX_ATTACHMENT_BYTES,
-    MAX_TOTAL_ATTACHMENT_BYTES,
+    MAX_STORED_MESSAGE_BYTES,
     MAX_ATTACHMENTS_PER_MESSAGE,
   },
 };

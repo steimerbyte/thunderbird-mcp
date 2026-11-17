@@ -1078,16 +1078,42 @@ function isValidBase64(value) {
 }
 // END INLINE ATTACHMENT BASE64 HELPERS
 // BEGIN OUTBOUND ATTACHMENT LIMITS
-const MAX_BASE64_SIZE = 25 * 1024 * 1024; // 25 MB limit for inline base64 data (encoded)
-// Cap file-path attachments to the same magnitude as saved-message attachments.
-// Prevents an MCP caller from attaching multi-GB files to a single outgoing message.
-const MAX_FILE_PATH_ATTACHMENT_BYTES = 50 * 1024 * 1024;
-const MAX_TOTAL_ATTACHMENT_BYTES = 50 * 1024 * 1024;
+// Gmail advertises 250-SIZE 35882577 at EHLO and counts the STORED message:
+// base64 body + 72-column wrapping + headers, never the decoded attachment.
+//   stored(n) = 4*ceil(n/3) + 2*ceil(4*ceil(n/3)/72) + 1228
+// The header term was 1084 on an early three-message probe and is 1228 on the
+// full-size probe send from this identity (one attachment). The larger, later
+// measurement wins: under-counting headers would let the gate accept a message
+// that stores larger than computed. With several attachments real headers grow
+// again, but by far less than one more part's overhead.
+const MAX_STORED_MESSAGE_BYTES = 35882577;
+const MAX_STORED_MESSAGE_HEADER_BYTES = 1228;
+const MAX_STORED_MESSAGE_BASE64_COLUMNS = 72;
+// 4*ceil(26183685/3) = 34911580 base64 bytes = 484883.05 wrapped lines
+// (+969768); +1228 headers = 35882576, one byte under the Gmail cap.
+// 26183790 would store at 35882718, 141 bytes OVER the advertised limit.
+const MAX_FILE_PATH_ATTACHMENT_BYTES = 26183685;
+// The same ceiling expressed as one inline base64 string.
+const MAX_BASE64_SIZE = 34911580;
 const MAX_ATTACHMENTS_PER_MESSAGE = 20;
+
+// Stored size of an already-encoded body: base64 plus 72-column CRLF wrapping.
+function getStoredEncodedBytes(encodedBytes) {
+  const encoded = Number.isSafeInteger(encodedBytes) && encodedBytes > 0 ? encodedBytes : 0;
+  return encoded + 2 * Math.ceil(encoded / MAX_STORED_MESSAGE_BASE64_COLUMNS);
+}
+
+// Stored size of one attachment's decoded bytes. A message total is the sum of
+// these plus MAX_STORED_MESSAGE_HEADER_BYTES, which is added once per message.
+function getStoredAttachmentBytes(attachmentBytes) {
+  const decoded = Number.isSafeInteger(attachmentBytes) && attachmentBytes > 0 ? attachmentBytes : 0;
+  return getStoredEncodedBytes(4 * Math.ceil(decoded / 3));
+}
 // END OUTBOUND ATTACHMENT LIMITS
-// Must be large enough to carry MAX_BASE64_SIZE plus JSON-RPC framing overhead.
+// Must be large enough to carry MAX_BASE64_SIZE (34911580, the largest inline
+// base64 a single attachment can need) plus JSON-RPC framing overhead.
 // The httpd.sys.mjs pre-buffer cap uses the same value.
-const MAX_REQUEST_BODY = 32 * 1024 * 1024; // 32 MB limit for incoming HTTP request bodies
+const MAX_REQUEST_BODY = 48 * 1024 * 1024; // 48 MB limit for incoming HTTP request bodies
 
 // BEGIN INLINE IMAGE CONTENT HELPERS
 // MCP image payloads are base64 text, so budget the encoded representation that
@@ -2823,7 +2849,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             attachments: {
               type: "array",
               maxItems: MAX_ATTACHMENTS_PER_MESSAGE,
-              description: "Attachments: file paths (strings) or inline objects ({name, contentType, base64})",
+              description: "Attachments: file paths (strings) or inline objects ({name, contentType, base64}). At most 20 entries and 26183685 bytes per file. The mail provider (Gmail) advertises 35882577 bytes per message and counts the stored message: base64 body (4/3 of the raw bytes) plus 72-column wrapping plus headers, so one maximal attachment leaves 1 byte of headroom. 25 MiB is decoded content, not the wire limit.",
               items: {
                 oneOf: [
                   { type: "string", description: "Absolute file path to attach" },
@@ -2873,7 +2899,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             attachments: {
               type: "array",
               maxItems: MAX_ATTACHMENTS_PER_MESSAGE,
-              description: "Attachments: file paths (strings) or inline objects ({name, contentType, base64})",
+              description: "Attachments: file paths (strings) or inline objects ({name, contentType, base64}). At most 20 entries and 26183685 bytes per file. The mail provider (Gmail) advertises 35882577 bytes per message and counts the stored message: base64 body (4/3 of the raw bytes) plus 72-column wrapping plus headers, so one maximal attachment leaves 1 byte of headroom. 25 MiB is decoded content, not the wire limit.",
               items: {
                 oneOf: [
                   { type: "string", description: "Absolute file path to attach" },
@@ -3157,7 +3183,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             attachments: {
               type: "array",
               maxItems: MAX_ATTACHMENTS_PER_MESSAGE,
-              description: "Attachments: file paths (strings) or inline objects ({name, contentType, base64})",
+              description: "Attachments: file paths (strings) or inline objects ({name, contentType, base64}). At most 20 entries and 26183685 bytes per file. The mail provider (Gmail) advertises 35882577 bytes per message and counts the stored message: base64 body (4/3 of the raw bytes) plus 72-column wrapping plus headers, so one maximal attachment leaves 1 byte of headroom. 25 MiB is decoded content, not the wire limit.",
               items: {
                 oneOf: [
                   { type: "string", description: "Absolute file path to attach" },
@@ -3203,7 +3229,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             attachments: {
               type: "array",
               maxItems: MAX_ATTACHMENTS_PER_MESSAGE,
-              description: "Additional attachments: file paths (strings) or inline objects ({name, contentType, base64})",
+              description: "Additional attachments: file paths (strings) or inline objects ({name, contentType, base64}). At most 20 entries and 26183685 bytes per file. The mail provider (Gmail) advertises 35882577 bytes per message and counts the stored message: base64 body (4/3 of the raw bytes) plus 72-column wrapping plus headers, so one maximal attachment leaves 1 byte of headroom. 25 MiB is decoded content, not the wire limit.",
               items: {
                 oneOf: [
                   { type: "string", description: "Absolute file path to attach" },
@@ -4813,6 +4839,44 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * wrapper below materializes only a completely accepted inspection.
              */
             // BEGIN OUTBOUND ATTACHMENT CONVERSION
+            /**
+             * Field-named validation for an inline attachment object. Returns ""
+             * when the entry is usable, otherwise one single-line reason.
+             * Objects are validated here so a malformed one can never fall
+             * through to the path branch and reach nsIFile.initWithPath.
+             */
+            function getInlineAttachmentError(entry) {
+              if (typeof entry.name !== "string" || !entry.name.trim()) {
+                return "name must be a non-empty string";
+              }
+              if (entry.contentType !== undefined && entry.contentType !== null &&
+                  (typeof entry.contentType !== "string" || !entry.contentType.trim())) {
+                return "contentType must be a non-empty string when supplied";
+              }
+              // Mirror the runtime's `entry.base64 || entry.content` precedence,
+              // so the reported field is the one that would actually be decoded.
+              const field = entry.base64 ? "base64" : entry.content ? "content" : null;
+              if (field) {
+                return typeof entry[field] === "string" ? "" : `${field} must be a base64 string`;
+              }
+              const supplied = entry.base64 !== undefined && entry.base64 !== null ? "base64"
+                : entry.content !== undefined && entry.content !== null ? "content" : null;
+              return supplied
+                ? `${supplied} is empty`
+                : "base64 is required for an inline attachment";
+            }
+
+            /**
+             * True when an attachment path is rooted: POSIX absolute, or a
+             * Windows drive/UNC path. nsIFile resolves relative paths against a
+             * working directory the add-on does not have, so they are refused.
+             */
+            function isAbsoluteAttachmentPath(attachmentPath) {
+              return attachmentPath.startsWith("/") ||
+                /^[a-zA-Z]:[\\/]/.test(attachmentPath) ||
+                attachmentPath.startsWith("\\\\");
+            }
+
             function inspectComposeAttachments(filePaths) {
               const descs = [];
               const failed = [];
@@ -4821,10 +4885,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               if (filePaths.length > MAX_ATTACHMENTS_PER_MESSAGE) {
                 throw new Error(`Attachment count ${filePaths.length} exceeds the ${MAX_ATTACHMENTS_PER_MESSAGE} attachment limit`);
               }
-              let totalAttachmentBytes = 0;
-              for (const entry of filePaths) {
+              let totalStoredBytes = 0;
+              for (let index = 0; index < filePaths.length; index++) {
+                const entry = filePaths[index];
+                const label = `Attachment ${index + 1}`;
                 try {
                   if (typeof entry === "string") {
+                    // A JSON-encoded attachment reached this array as a string.
+                    // It is not a path, so name the shape instead of handing it
+                    // to nsIFile.initWithPath (which fails unrecognized).
+                    if (!entry || entry.trim().startsWith("{") || entry.trim().startsWith("[")) {
+                      failed.push(`${label} rejected: string looks like JSON; pass attachments as an array of paths or inline {name, base64} objects, not a JSON-encoded string`);
+                      continue;
+                    }
                     // File path attachment.
                     //
                     // SECURITY: reject paths that point at credentials, system
@@ -4859,9 +4932,16 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       failed.push(`${entry} (sensitive path blocked)`);
                       continue;
                     }
+                    if (!isAbsoluteAttachmentPath(entry)) {
+                      failed.push(`${entry} (not an absolute path; file paths must be absolute)`);
+                      continue;
+                    }
                     const file = createLocalFile(entry);
                     if (!file.exists()) {
-                      failed.push(entry);
+                      // The add-on resolves this path in its own filesystem, which
+                      // a container/sandbox deployment does not share with the
+                      // caller. Name both escapes rather than echoing the bare path.
+                      failed.push(`${entry} (not found; the add-on resolves paths in its own filesystem, so in a container or sandbox deployment stage the file under a shared directory or send inline base64)`);
                       continue;
                     }
                     let isSymlink;
@@ -4931,6 +5011,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       failed.push(`${entry} (not a regular file)`);
                       continue;
                     }
+                    let isReadable;
+                    try {
+                      isReadable = file.isReadable();
+                    } catch {
+                      failed.push(`${entry} (unreadable: permission check failed)`);
+                      continue;
+                    }
+                    if (!isReadable) {
+                      failed.push(`${entry} (unreadable: permission denied)`);
+                      continue;
+                    }
                     // Size cap mirrors the saved-attachment ceiling and avoids
                     // ballooning outgoing messages when a caller points at a huge file.
                     let fileSize;
@@ -4945,17 +5036,23 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       continue;
                     }
                     if (fileSize > MAX_FILE_PATH_ATTACHMENT_BYTES) {
-                      failed.push(`${entry} (exceeds ${MAX_FILE_PATH_ATTACHMENT_BYTES / 1024 / 1024}MB size limit)`);
+                      failed.push(`${entry} (too large: ${fileSize} bytes exceeds the ${MAX_FILE_PATH_ATTACHMENT_BYTES} byte MAX_FILE_PATH_ATTACHMENT_BYTES limit)`);
                       continue;
                     }
-                    if (fileSize > MAX_TOTAL_ATTACHMENT_BYTES - totalAttachmentBytes) {
-                      failed.push(`${entry} (exceeds ${MAX_TOTAL_ATTACHMENT_BYTES / 1024 / 1024}MB aggregate attachment limit)`);
-                      continue;
-                    }
+                    // Stored size: base64 plus 72-column wrapping, the bytes
+                    // the provider actually counts.
+                    totalStoredBytes += getStoredAttachmentBytes(fileSize);
                     const desc = { url: Services.io.newFileURI(file).spec, name: file.leafName, size: fileSize };
                     descs.push(desc);
-                    totalAttachmentBytes += fileSize;
-                  } else if (entry && typeof entry === "object" && (entry.base64 || entry.content) && entry.name) {
+                  } else if (entry && typeof entry === "object" && !Array.isArray(entry)) {
+                    // Inline base64 attachment: validated field by field so a
+                    // malformed object is reported as a malformed object instead
+                    // of falling through to the path branch and its nsIFile.
+                    const inlineError = getInlineAttachmentError(entry);
+                    if (inlineError) {
+                      failed.push(`${label} rejected: ${inlineError}`);
+                      continue;
+                    }
                     // Inspect base64 without decoding or allocating a file.
                     const b64Data = entry.base64 || entry.content;
                     if (!isValidBase64(b64Data)) {
@@ -4963,27 +5060,29 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       continue;
                     }
                     if (b64Data.length > MAX_BASE64_SIZE) {
-                      failed.push(`${entry.name} (exceeds ${MAX_BASE64_SIZE / 1024 / 1024}MB size limit)`);
+                      failed.push(`${entry.name} (exceeds the ${MAX_BASE64_SIZE} byte MAX_BASE64_SIZE limit)`);
                       continue;
                     }
                     const padding = b64Data.endsWith("==") ? 2 : b64Data.endsWith("=") ? 1 : 0;
                     const decodedSize = (b64Data.length / 4) * 3 - padding;
-                    if (decodedSize > MAX_TOTAL_ATTACHMENT_BYTES - totalAttachmentBytes) {
-                      failed.push(`${entry.name} (exceeds ${MAX_TOTAL_ATTACHMENT_BYTES / 1024 / 1024}MB aggregate attachment limit)`);
-                      continue;
-                    }
+                    // The base64 text is the encoded body; only wrapping is added.
+                    totalStoredBytes += getStoredEncodedBytes(b64Data.length);
                     descs.push({ name: entry.name, size: decodedSize, inlineBase64: b64Data,
                       ...(entry.contentType ? { contentType: entry.contentType } : {}) });
-                    totalAttachmentBytes += decodedSize;
                   } else {
-                    failed.push(typeof entry === "object" ? JSON.stringify(entry) : String(entry));
+                    const kind = entry === null ? "null" : Array.isArray(entry) ? "array" : typeof entry;
+                    failed.push(`${label} rejected: ${kind} is not a file path string or an inline {name, base64} object`);
                   }
                 } catch (e) {
-                  const label = entry && typeof entry === "object" ? (entry.name || JSON.stringify(entry)) : String(entry);
-                  failed.push(`${label} (${e.message || e})`);
+                  const entryLabel = entry && typeof entry === "object" ? (entry.name || label) : `${label}: ${entry}`;
+                  failed.push(`${entryLabel} (${e.message || e})`);
                 }
               }
               if (failed.length) throw new Error(`Attachments refused: ${failed.join(", ")}`);
+              const storedMessageBytes = totalStoredBytes + MAX_STORED_MESSAGE_HEADER_BYTES;
+              if (storedMessageBytes > MAX_STORED_MESSAGE_BYTES) {
+                throw new Error(`Attachments refused: stored message size ${storedMessageBytes} bytes (base64 body + 72-column wrapping + headers) exceeds the ${MAX_STORED_MESSAGE_BYTES} byte limit the mail provider advertises (Gmail 250-SIZE); the largest single attachment this allows is ${MAX_FILE_PATH_ATTACHMENT_BYTES} bytes`);
+              }
               return { descs, failed };
             }
 
@@ -5966,6 +6065,34 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 getComposeBase64Size(2 * bytes));
             }
 
+            // Only known-text bodies may be quoted-printable; Thunderbird sends
+            // every other body base64. Applying the QP 3x bound to binary
+            // over-estimates by ~2.25x and blocked sends far below the provider
+            // limit (an 18.5 MB attachment estimated 72 MB).
+            // shortcut: encoding is inferred from contentType, not sniffed; a
+            // mislabeled binary file is over-estimated (safe direction), a
+            // mislabeled text file could be under-estimated by up to 2.25x --
+            // upgrade to content sniffing if a real case appears.
+            const COMPOSE_TEXTUAL_TYPES = new Set([
+              "application/json", "application/xml", "application/javascript",
+              "application/x-javascript", "application/xhtml+xml",
+            ]);
+            function isComposeTextualType(contentType) {
+              const type = String(contentType || "").trim().toLowerCase();
+              return type.startsWith("text/") || COMPOSE_TEXTUAL_TYPES.has(type);
+            }
+
+            // Per-attachment stored size. An inline object already carries its
+            // encoded text, so its exact length is used and never estimated.
+            function getComposeAttachmentSize(attachment) {
+              if (typeof attachment.inlineBase64 === "string") return attachment.inlineBase64.length;
+              const size = attachment.size;
+              // A non-integer size must fail closed, not be treated as zero.
+              if (!Number.isSafeInteger(size) || size < 0) throw new Error("Unbounded compose size");
+              return isComposeTextualType(attachment.contentType)
+                ? getComposeTextSize(size) : getComposeBase64Size(size);
+            }
+
             function estimateComposeSize(plan) {
               const { identity, body, headers = [], attachments = [], useHtml = false } = plan;
               const inheritedRawBytes = Object.hasOwn(plan, "inheritedRawBytes") ? plan.inheritedRawBytes : 0;
@@ -6017,14 +6144,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               // expansions to every raw attachment byte would double-count them.
               bytes += getComposeTextSize(validSize(inheritedRawBytes));
               for (const attachment of attachments) {
-                const size = validSize(attachment.size);
                 bytes += COMPOSE_SIZE_PART_BYTES;
                 bytes += 2 * getComposeTextSize(textBytes(attachment.name) + textBytes(attachment.contentType ?? "")
                   + textBytes(attachment.url ?? ""));
-                // Only a known binary type guarantees base64. Path/type inference
-                // and textual attachments need the QP worst case instead.
-                bytes += attachment.contentType === "application/octet-stream"
-                  ? getComposeBase64Size(size) : getComposeTextSize(size);
+                // Text attachments may be quoted-printable; binary bodies are
+                // base64, so 4/3 is the right bound for them.
+                bytes += getComposeAttachmentSize(attachment);
               }
               if (identity.attachVCard) {
                 // Percent-unescaping cannot exceed the escaped input's byte count.
@@ -6051,7 +6176,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (estimatedEncodedBytes === null) {
                   warning = `Unreviewed sending is blocked because the encoded message size could not be safely bounded. ${COMPOSE_SIZE_REVIEW}`;
                 } else if (estimatedEncodedBytes > warningThresholdBytes) {
-                  warning = `Unreviewed sending is blocked because the conservative encoded size estimate (${estimatedEncodedBytes} bytes) exceeds Thunderbird's large-message threshold (${warningThresholdBytes} bytes). ${COMPOSE_SIZE_REVIEW}`;
+                  warning = `Unreviewed sending is blocked because the conservative encoded size estimate (${estimatedEncodedBytes} bytes) exceeds Thunderbird's large-message threshold (${warningThresholdBytes} bytes). ${COMPOSE_SIZE_REVIEW} An operator can raise ${COMPOSE_SIZE_WARNING_PREF} or use skipReview:false.`;
                 }
               }
               return { estimatedEncodedBytes, warningThresholdBytes, warning };

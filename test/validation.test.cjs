@@ -72,7 +72,10 @@ function loadProductionAttachmentValidation(overrides = {}, transform = code => 
     'this.validateAgainstSchema = validateAgainstSchema;',
     'this.filePathsToAttachDescs = filePathsToAttachDescs;',
     'this.dryRunCompose = dryRunCompose;',
-    'this.attachmentLimits = { MAX_TOTAL_ATTACHMENT_BYTES, MAX_ATTACHMENTS_PER_MESSAGE };',
+    'this.attachmentLimits = { MAX_STORED_MESSAGE_BYTES, MAX_FILE_PATH_ATTACHMENT_BYTES, MAX_ATTACHMENTS_PER_MESSAGE };',
+    'this.getStoredAttachmentBytes = getStoredAttachmentBytes;',
+    'this.getComposeAttachmentSize = getComposeAttachmentSize;',
+    'this.estimateComposeSize = estimateComposeSize;',
     'this.maxHeaderBatchIds = MAX_HEADER_BATCH_IDS;',
   ].join('\n')), sandbox);
   if (sandbox.server) {
@@ -1015,19 +1018,21 @@ describe('Validation: attachment sending', () => {
       new RegExp(`Attachment count ${maxCount + 1} exceeds the ${maxCount} attachment limit`));
   });
 
-  it('production runtime enforces a 50MB aggregate attachment cap', () => {
+  it('production runtime enforces the stored-message cap Gmail advertises', () => {
+    // Two 12 MiB binaries store as 2 * (16777216 + 2*233018) = 34474504 bytes,
+    // plus 1228 headers, under 35882577. A third 2 MiB file pushes it over.
     const mib = 1024 * 1024;
     const entries = ['/tmp/first.bin', '/tmp/second.bin', '/tmp/over.bin'];
     const files = new Map([
-      [entries[0], makeMockLocalFile(entries[0], { size: 30 * mib })],
-      [entries[1], makeMockLocalFile(entries[1], { size: 20 * mib })],
-      [entries[2], makeMockLocalFile(entries[2], { size: 1 })],
+      [entries[0], makeMockLocalFile(entries[0], { size: 12 * mib })],
+      [entries[1], makeMockLocalFile(entries[1], { size: 12 * mib })],
+      [entries[2], makeMockLocalFile(entries[2], { size: 2 * mib })],
     ]);
     const { limits, result } = convertProductionFileAttachments(entries.slice(0, 2), files);
-    assert.equal(limits.MAX_TOTAL_ATTACHMENT_BYTES, 50 * mib);
-    assert.equal(result.descs.length, 2, 'attachments exactly at the aggregate cap should pass');
-    assert.equal(result.descs.reduce((total, desc) => total + desc.size, 0), 50 * mib);
-    assert.throws(() => convertProductionFileAttachments(entries, files), /over\.bin \(exceeds 50MB aggregate attachment limit\)/);
+    assert.equal(limits.MAX_STORED_MESSAGE_BYTES, 35882577);
+    assert.equal(result.descs.length, 2, 'two 12 MiB attachments fit the stored-message cap');
+    assert.throws(() => convertProductionFileAttachments(entries, files),
+      /Attachments refused: stored message size \d+ bytes \(base64 body \+ 72-column wrapping \+ headers\) exceeds the 35882577 byte limit the mail provider advertises \(Gmail 250-SIZE\); the largest single attachment this allows is 26183685 bytes/);
   });
 
   it('production runtime fails closed on normalization, type, and size checks', () => {
@@ -2755,14 +2760,14 @@ describe('dryRunCompose behavior', () => {
     }
   });
 
-  it('applies the aggregate attachment limit to inline entries like the real path', () => {
+  it('applies the encoded aggregate limit to inline entries like the real path', () => {
     const { runtime } = makeRuntime();
-    const chunk = 'A'.repeat(20 * 1024 * 1024); // 15 MiB decoded each
-    const entries = [1, 2, 3, 4].map(i => ({ name: `part${i}.bin`, base64: chunk }));
+    const chunk = 'A'.repeat(12 * 1024 * 1024); // 12 MiB of base64 text each
+    const entries = [1, 2, 3].map(i => ({ name: `part${i}.bin`, base64: chunk }));
     const dry = runtime.dryRunCompose({ to: 'a@example.com', subject: 's', body: 'b', isHtml: false, attachments: entries });
     const real = runtime.composeMail({ to: 'a@example.com', subject: 's', body: 'b', isHtml: false, attachments: entries, skipReview: false });
     assert.equal(dry.wouldSucceed, false);
-    assert.match(dry.blockers[0], /aggregate attachment limit/);
+    assert.match(dry.blockers[0], /exceeds the 35882577 byte limit the mail provider advertises/);
     assert.equal(dry.blockers[0], real.error.replace(/^Error: /, ''));
   });
 
@@ -3034,6 +3039,38 @@ describe('Conservative compose size preflight', () => {
     }
   });
 
+  it('names mailnews.message_warning_size in the refusal so an operator can fix it', () => {
+    const { runtime, state } = makeRuntime({ prefs: { [thresholdPref]: 20 * 1024 * 1024 } });
+    // 8 MB of body estimates above 20 MiB once QP expansion and the 1.25 margin are applied.
+    const result = runtime.dryRunCompose({ ...args, body: 'x'.repeat(8 * 1024 * 1024) });
+    assert.equal(result.wouldSucceed, false);
+    assert.match(result.blockers[0], /exceeds Thunderbird's large-message threshold/);
+    assert.match(result.blockers[0], /raise mailnews\.message_warning_size or use skipReview:false/);
+    assert.match(result.blockers[0], /Use skipReview: false to review the message in Thunderbird\./);
+    noExecution(state);
+  });
+
+  it('no longer charges a binary attachment at the QP 3x rate', () => {
+    // The same attachment used to estimate 72,342,434 bytes (3x the raw size)
+    // because its type was not application/octet-stream. Measured on prod mail
+    // 2026-11-17: an 18.5 MB attachment stored 25,352,938 bytes in total.
+    const size = 18500000;
+    const base64 = 'A'.repeat(4 * Math.ceil(size / 3));
+    const asBinary = makeRuntime().runtime.dryRunCompose({ ...args, attachments: [
+      { name: 'payload.bin', contentType: 'application/octet-stream', base64 },
+    ] });
+    // 25,351,854 for the part, times the 1.25 safety margin plus the body and
+    // header floor (measured: 30,908,035), against the old 72,342,434 refusal.
+    assert.ok(asBinary.estimatedEncodedBytes > 25351854 && asBinary.estimatedEncodedBytes < 32000000,
+      String(asBinary.estimatedEncodedBytes));
+    assert.ok(asBinary.estimatedEncodedBytes < 3 * size, 'must stay well under the old 3x charge');
+    // A text/plain body of the same size still takes the QP 3x bound, so its
+    // estimate is provably larger: the guard is preserved, not removed.
+    const stored = productionAttachmentValidation;
+    assert.ok(stored.getComposeAttachmentSize({ name: 'a.txt', contentType: 'text/plain', size })
+      > stored.getComposeAttachmentSize({ name: 'a.bin', contentType: 'application/octet-stream', size }));
+  });
+
   for (const threshold of [0, -1]) {
     it(`does not gate sizes when the user's threshold is ${threshold}`, () => {
       const { runtime, state } = makeRuntime({ prefs: { [thresholdPref]: threshold } });
@@ -3258,5 +3295,266 @@ describe('Validation: searchAttachments', () => {
     });
     assert.equal(errors.length, 1);
     assert.match(errors[0], /Unknown parameter: regex/);
+  });
+});
+
+// Regression cover for outbound attachment refusals: every refused entry must
+// name its own field, and a malformed inline object must never reach
+// nsIFile.initWithPath as a path. Fixtures live in the OS temp dir.
+describe('Outbound attachment refusals', () => {
+  const os = require('node:os');
+  const { makeAllowedTempDir } = require('./helpers/fixture-dir.cjs');
+
+  // Real nsIFile semantics: initWithPath only accepts a string, so a
+  // stringified object surfaces as NS_ERROR_FILE_UNRECOGNIZED_PATH.
+  function makeRuntimeWithRealFiles() {
+    const runtime = loadProductionAttachmentValidation({
+      os: process.platform,
+      createLocalFile(filePath) {
+        if (typeof filePath !== 'string') {
+          throw new Error('Component returned failure code: 0x80520001 (NS_ERROR_FILE_UNRECOGNIZED_PATH) [nsIFile.initWithPath]');
+        }
+        const stat = fs.existsSync(filePath) ? fs.lstatSync(filePath) : null;
+        const file = {
+          path: filePath,
+          leafName: filePath.split(/[\\/]/).pop(),
+          clone() { return { ...file }; },
+          exists: () => stat !== null,
+          isSymlink: () => stat?.isSymbolicLink() ?? false,
+          normalize() {},
+          isFile: () => stat?.isFile() ?? false,
+          isReadable: () => stat !== null,
+          get fileSize() { return stat?.size ?? 0; },
+        };
+        return file;
+      },
+      Services: {
+        appinfo: { OS: process.platform === 'win32' ? 'WINNT' : 'Linux' },
+        dirsvc: {
+          get(key) {
+            // Profile roots must not alias the temp dir: a real profile is not
+            // the temp dir, and aliasing them would trip the profile check.
+            if (key !== 'TmpD') throw new Error(`directory unavailable: ${key}`);
+            const dir = { path: os.tmpdir(), clone() { return dir; }, normalize() {}, append() {} };
+            return dir;
+          },
+        },
+        io: { newFileURI: file => ({ spec: 'file://' + file.path }) },
+      },
+    });
+    return runtime;
+  }
+
+  let root;
+  function fixture(name, bytes) {
+    if (!root) {
+      root = makeAllowedTempDir('tb-mcp-attachment-');
+      process.once('exit', () => fs.rmSync(root, { recursive: true, force: true }));
+    }
+    const file = path.join(root, name);
+    fs.writeFileSync(file, bytes);
+    return file;
+  }
+
+  for (const [label, entry, expected] of [
+    ['empty base64', { name: 'a.pdf', contentType: 'application/pdf', base64: '' }, /Attachment 1 rejected: base64 is empty/],
+    ['missing base64', { name: 'a.pdf' }, /Attachment 1 rejected: base64 is required for an inline attachment/],
+    ['non-string base64', { name: 'a.pdf', base64: 42 }, /Attachment 1 rejected: base64 must be a base64 string/],
+    ['empty name', { name: '', base64: 'QQ==' }, /Attachment 1 rejected: name must be a non-empty string/],
+    ['guarded content alias', { name: 'a.pdf', content: '' }, /Attachment 1 rejected: content is empty/],
+    ['bad contentType', { name: 'a.pdf', contentType: 7, base64: 'QQ==' }, /Attachment 1 rejected: contentType must be a non-empty string when supplied/],
+    ['array entry', ['nested'], /Attachment 1 rejected: array is not a file path string/],
+    ['null entry', null, /Attachment 1 rejected: null is not a file path string/],
+  ]) {
+    it(`rejects an inline object with ${label} by field name and never as a path`, () => {
+      const runtime = makeRuntimeWithRealFiles();
+      assert.throws(() => runtime.filePathsToAttachDescs([entry]), error => {
+        assert.match(error.message, expected);
+        // A stringified object would reach nsIFile and report its failure code.
+        assert.doesNotMatch(error.message, /NS_ERROR_FILE_UNRECOGNIZED_PATH|initWithPath/);
+        return true;
+      });
+    });
+  }
+
+  it('reports the failing index for every malformed entry', () => {
+    const runtime = makeRuntimeWithRealFiles();
+    assert.throws(() => runtime.filePathsToAttachDescs([
+      { name: 'ok.txt', base64: 'QQ==' },
+      { name: 'second.pdf', base64: '' },
+    ]), /Attachment 2 rejected: base64 is empty/);
+  });
+
+  it('rejects a JSON-encoded object string without touching the filesystem', () => {
+    let fileCalls = 0;
+    const runtime = loadProductionAttachmentValidation({
+      createLocalFile() { fileCalls++; throw new Error('must not be called'); },
+      Services: { appinfo: { OS: 'Linux' }, dirsvc: { get: () => { throw new Error('no dirs'); } } },
+    });
+    const entry = '{"name":"a.pdf","contentType":"application/pdf","base64":""}';
+    assert.throws(() => runtime.filePathsToAttachDescs([entry]), /Attachment 1 rejected: string looks like JSON/);
+    assert.equal(fileCalls, 0);
+  });
+
+  it('accepts an absolute path to a readable file', () => {
+    const file = fixture('report.pdf', '%PDF-1.4 fixture');
+    const runtime = makeRuntimeWithRealFiles();
+    const { descs } = runtime.filePathsToAttachDescs([file]);
+    assert.equal(descs.length, 1);
+    assert.equal(descs[0].name, 'report.pdf');
+    assert.equal(descs[0].size, Buffer.byteLength('%PDF-1.4 fixture'));
+  });
+
+  it('accepts a multi-megabyte file', () => {
+    const size = 3_759_827; // the measured 3.6 MB PDF, byte for byte
+    const file = fixture('large.pdf', Buffer.alloc(size, 7));
+    const runtime = makeRuntimeWithRealFiles();
+    const { descs } = runtime.filePathsToAttachDescs([file]);
+    assert.equal(descs.length, 1);
+    assert.equal(descs[0].size, size);
+  });
+
+  it('names the reason for a missing path and the container escape hatch', () => {
+    const runtime = makeRuntimeWithRealFiles();
+    const missing = path.join(os.tmpdir(), 'tb-mcp-absent-attachment.pdf');
+    assert.throws(() => runtime.filePathsToAttachDescs([missing]), error => {
+      assert.ok(error.message.includes(missing));
+      assert.match(error.message, /not found/);
+      assert.match(error.message, /its own filesystem/);
+      assert.match(error.message, /inline base64/);
+      return true;
+    });
+  });
+
+  it('rejects a relative path before any filesystem access', () => {
+    const runtime = makeRuntimeWithRealFiles();
+    assert.throws(() => runtime.filePathsToAttachDescs(['report.pdf']), /not an absolute path/);
+  });
+
+  it('reports a directory as not a regular file', () => {
+    fixture('placeholder.txt', 'x');
+    const runtime = makeRuntimeWithRealFiles();
+    assert.throws(() => runtime.filePathsToAttachDescs([root]), /not a regular file/);
+  });
+
+  it('names MAX_FILE_PATH_ATTACHMENT_BYTES when a file is too large', () => {
+    const runtime = loadProductionAttachmentValidation({
+      createLocalFile: filePath => makeMockLocalFile(filePath, { size: 26183686 }),
+      Services: { appinfo: { OS: 'Linux' }, dirsvc: { get: () => { throw new Error('no dirs'); } }, io: { newFileURI: () => ({ spec: 'file:///x' }) } },
+    });
+    assert.throws(() => runtime.filePathsToAttachDescs(['/tmp/too-large.bin']), error => {
+      assert.match(error.message, /too large: 26183686 bytes exceeds the 26183685 byte MAX_FILE_PATH_ATTACHMENT_BYTES limit/);
+      return true;
+    });
+  });
+
+  // Gmail advertises 250-SIZE 35882577 at EHLO and counts the STORED message:
+  // 4*ceil(n/3) + 2*ceil(that/72) + 1228, header term from the full-size probe send.
+  function sparseFixture(name, size) {
+    const file = fixture(name, '');
+    fs.truncateSync(file, size);
+    return file;
+  }
+  const MAX_SINGLE = 26183685;
+
+  it('accepts exactly 26183685 decoded bytes and refuses one byte more', () => {
+    const { descs } = makeRuntimeWithRealFiles().filePathsToAttachDescs([sparseFixture('max.pdf', MAX_SINGLE)]);
+    assert.equal(descs.length, 1);
+    assert.equal(descs[0].size, MAX_SINGLE);
+    // 4*ceil(26183685/3) = 34911580 -> 484884 wrapped lines; + 1228 headers
+    // = 35882576, one byte under Gmail's advertised cap.
+    assert.equal(4 * Math.ceil(MAX_SINGLE / 3), 34911580);
+    assert.equal(Math.ceil(34911580 / 72), 484884);
+    assert.equal(34911580 + 2 * 484884 + 1228, 35882576);
+    assert.throws(() => makeRuntimeWithRealFiles().filePathsToAttachDescs([sparseFixture('over.pdf', MAX_SINGLE + 1)]),
+      /too large: 26183686 bytes exceeds the 26183685 byte MAX_FILE_PATH_ATTACHMENT_BYTES limit/);
+  });
+
+  it('keeps MAX_FILE_PATH_ATTACHMENT_BYTES at the largest size the model allows', () => {
+    // A drift here means the constant and the header term disagree: the shipped
+    // cap must be the largest n whose stored size fits, and n+1 must not.
+    const runtime = productionAttachmentValidation;
+    const cap = runtime.attachmentLimits.MAX_FILE_PATH_ATTACHMENT_BYTES;
+    const stored = n => runtime.getStoredAttachmentBytes(n) + 1228;
+    assert.equal(cap, MAX_SINGLE);
+    assert.ok(stored(cap) <= 35882577, `cap must fit: ${stored(cap)}`);
+    assert.ok(stored(cap + 1) > 35882577, `cap+1 must overflow: ${stored(cap + 1)}`);
+    assert.ok(stored(cap + 1) > stored(cap));
+    // 26,183,790 is what the 1084 model allowed; with 1228 it stores 141 over.
+    assert.equal(stored(26183790), 35882718);
+  });
+
+  it('estimates an 18,500,000-byte binary at the measured 25,352,938 bytes, not 3x', () => {
+    const runtime = productionAttachmentValidation;
+    // The part term is 25,351,854; the measured 25,352,938 stored bytes on that
+    // early probe included 1084 of headers. The old QP rule charged 3 * 18,500,000.
+    assert.equal(runtime.getComposeAttachmentSize(
+      { name: 'a.bin', contentType: 'application/octet-stream', size: 18500000 }), 25351854);
+    assert.equal(runtime.getStoredAttachmentBytes(18500000) + 1084, 25352938);
+    // The real gate accepts a single 18.5 MB binary: 25,352,938 stored bytes
+    // against the 35,882,577 cap. The old QP rule refused it at ~72 MB.
+    const descs = makeRuntimeWithRealFiles().filePathsToAttachDescs(
+      [sparseFixture('binary-18.5.bin', 18500000)], { dryRun: true }).descs;
+    assert.equal(descs.length, 1);
+    assert.ok(runtime.getStoredAttachmentBytes(18500000) + 1228 < 35882577);
+  });
+
+  it('still applies the QP 3x bound to text/plain, and only to text types', () => {
+    const runtime = productionAttachmentValidation;
+    const size = 18500000;
+    const binary = runtime.getComposeAttachmentSize({ name: 'a.bin', contentType: 'application/octet-stream', size });
+    const pdf = runtime.getComposeAttachmentSize({ name: 'a.pdf', contentType: 'application/pdf', size });
+    const unknown = runtime.getComposeAttachmentSize({ name: 'a.dat', size });
+    const text = runtime.getComposeAttachmentSize({ name: 'a.txt', contentType: 'text/plain', size });
+    // Binary and unknown types take the base64 model: 4*ceil(n/3) + wrapping.
+    for (const bytes of [binary, pdf, unknown]) {
+      assert.equal(bytes, 4 * Math.ceil(size / 3) + 2 * Math.ceil(4 * Math.ceil(size / 3) / 72));
+    }
+    assert.equal(text, 3 * size + 3 * (Math.floor(3 * size / 72) + 1) + 2);
+    assert.ok(text > binary, 'the text QP worst case must stay the larger bound');
+    // An inline object's encoded text is exact and never re-estimated.
+    assert.equal(runtime.getComposeAttachmentSize({ name: 'i.bin', contentType: 'text/plain', inlineBase64: 'A'.repeat(1234) }), 1234);
+  });
+
+  it('makes a text attachment the reason a mixed pair overflows, when binaries fit', () => {
+    // Two 20 MB + 6 MB binaries store as 35,630,862 bytes and fit the cap; the
+    // same 6 MB as text/plain is 18,750,005 (QP worst case) and overflows.
+    const runtime = productionAttachmentValidation;
+    const binaryPair = runtime.getStoredAttachmentBytes(20000000)
+      + runtime.getStoredAttachmentBytes(6000000) + 1228;
+    const textPair = runtime.getStoredAttachmentBytes(20000000)
+      + runtime.getComposeAttachmentSize({ name: 'log.txt', contentType: 'text/plain', size: 6000000 }) + 1228;
+    assert.equal(binaryPair, 35630862);
+    assert.ok(binaryPair <= 35882577, `two binaries must fit: ${binaryPair}`);
+    assert.equal(textPair, 46158643);
+    assert.ok(textPair > 35882577, `the text one must break it: ${textPair}`);
+    // The stored-byte gate is type-blind by design, so this pair of path files
+    // (35,630,862 bytes) is accepted; only the length-aware estimate refuses it.
+    const files = [sparseFixture('movie.mp4', 20000000), sparseFixture('log.txt', 6000000)];
+    assert.equal(makeRuntimeWithRealFiles().filePathsToAttachDescs(files, { dryRun: true }).descs.length, 2);
+    // One byte more of stored budget is where the gate itself starts refusing.
+    const overFiles = [sparseFixture('over-a.bin', 20000000), sparseFixture('over-b.bin', 7000000)];
+    assert.throws(() => makeRuntimeWithRealFiles().filePathsToAttachDescs(overFiles),
+      /stored message size \d+ bytes \(base64 body \+ 72-column wrapping \+ headers\) exceeds the 35882577 byte limit/);
+  });
+
+  it('accepts inline base64 at exactly 34911580 bytes and refuses one byte more', () => {
+    const atCap = { name: 'big.bin', contentType: 'application/octet-stream', base64: 'A'.repeat(34911580) };
+    const { descs } = makeRuntimeWithRealFiles().filePathsToAttachDescs([atCap], { dryRun: true });
+    assert.equal(descs.length, 1);
+    assert.equal(descs[0].inlineBase64.length, 34911580);
+    // +4 keeps quartet alignment, so this is refused by the size cap, not the shape check.
+    const over = { name: 'bigger.bin', contentType: 'application/octet-stream', base64: 'A'.repeat(34911584) };
+    assert.throws(() => makeRuntimeWithRealFiles().filePathsToAttachDescs([over], { dryRun: true }),
+      /bigger\.bin \(exceeds the 34911580 byte MAX_BASE64_SIZE limit\)/);
+  });
+
+  it('accepts a 10 MB path file plus inline base64 totalling ~19.4 MB stored', () => {
+    const file = sparseFixture('ten.pdf', 10 * 1024 * 1024);
+    const inline = { name: 'inline.bin', contentType: 'application/octet-stream', base64: 'A'.repeat(6500000) };
+    const stored = 13981016 + 2 * Math.ceil(13981016 / 72) + 6500000 + 2 * Math.ceil(6500000 / 72) + 1228;
+    assert.ok(stored > 20 * 1024 * 1024 && stored < 35882577, String(stored));
+    const { descs } = makeRuntimeWithRealFiles().filePathsToAttachDescs([file, inline], { dryRun: true });
+    assert.deepEqual(Array.from(descs, desc => desc.name), ['ten.pdf', 'inline.bin']);
   });
 });

@@ -8,6 +8,16 @@ const vm = require("node:vm");
 
 const extensionDir = path.resolve(__dirname, "../extension");
 const manifest = JSON.parse(fs.readFileSync(path.join(extensionDir, "manifest.json"), "utf8"));
+
+describe("Fork manifest", () => {
+  // This build is deployed by hand with local patches. An update_url pointing at
+  // the upstream feed would let the add-on auto-updater replace the patched
+  // build with an unpatched release, so the key must stay absent.
+  it("declares no update_url", () => {
+    assert.equal(Object.hasOwn(manifest.browser_specific_settings.gecko, "update_url"), false);
+    assert.equal(JSON.stringify(manifest).includes("update_url"), false);
+  });
+});
 const source = fs.readFileSync(path.join(extensionDir, "mcp_server/api.js"), "utf8");
 const START = "// BEGIN EXPERIMENT GLOBAL IMPORTS";
 const END = "// END EXPERIMENT GLOBAL IMPORTS";

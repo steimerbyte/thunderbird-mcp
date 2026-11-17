@@ -320,8 +320,9 @@ describe('Bridge attachment path policy', () => {
     );
   });
 
-  it('rejects an aggregate of path attachments above 50 MB before reading', async () => {
-    const sizes = [18, 18, 15].map(mib => mib * 1024 * 1024);
+  it('rejects an aggregate of path attachments above the stored-message cap before reading', async () => {
+    // 20 MiB + 7 MiB store as 37,001,090 bytes with headers, over Gmail's 35,882,577.
+    const sizes = [20, 7].map(mib => mib * 1024 * 1024);
     const attachments = sizes.map((size, index) => {
       const filePath = path.join(root, `aggregate-${index}.bin`);
       fs.writeFileSync(filePath, '');
@@ -333,8 +334,8 @@ describe('Bridge attachment path policy', () => {
     await assert.rejects(
       inlineAttachmentPaths(args),
       error => {
-        assert.match(error.message, /50 MB aggregate attachment limit/);
-        assert.ok(error.message.includes(attachments[2]), error.message);
+        assert.match(error.message, /exceeds the 35882577 byte limit the mail provider advertises \(Gmail 250-SIZE\)/);
+        assert.ok(error.message.includes(attachments[1]), error.message);
         return true;
       }
     );
@@ -680,6 +681,38 @@ describe('Bridge attachment path policy', () => {
       },
       inline,
     ]);
+  });
+
+  for (const [label, entry, expected] of [
+    ['empty base64', { name: 'a.pdf', base64: '' }, /Attachment 1 rejected: base64 is empty/],
+    ['missing base64', { name: 'a.pdf' }, /Attachment 1 rejected: base64 is required for an inline attachment/],
+    ['non-string base64', { name: 'a.pdf', base64: 3 }, /Attachment 1 rejected: base64 must be a base64 string/],
+    ['empty name', { name: '', base64: 'QQ==' }, /Attachment 1 rejected: name must be a non-empty string/],
+    ['bad contentType', { name: 'a.pdf', contentType: 1, base64: 'QQ==' }, /contentType must be a non-empty string/],
+    ['null entry', null, /Attachment 1 rejected: null is not a file path string/],
+  ]) {
+    it(`refuses an inline object with ${label} by field name`, async () => {
+      const args = { attachments: [entry] };
+      await assert.rejects(inlineAttachmentPaths(args), expected);
+      // A refused request must stay unchanged, never partially rewritten.
+      assert.deepEqual(args.attachments, [entry]);
+    });
+  }
+
+  it('refuses a JSON-encoded attachment string by shape, not as a missing file', async () => {
+    const args = { attachments: ['{"name":"a.pdf","base64":""}'] };
+    await assert.rejects(inlineAttachmentPaths(args), /Attachment 1 rejected: string looks like JSON/);
+    assert.deepEqual(args.attachments, ['{"name":"a.pdf","base64":""}']);
+  });
+
+  it('explains that a missing path is resolved in the server filesystem', async () => {
+    const missing = path.join(root, 'definitely-absent.pdf');
+    await assert.rejects(inlineAttachmentPaths({ attachments: [missing] }), error => {
+      assert.ok(error.message.includes(missing));
+      assert.match(error.message, /its own filesystem/);
+      assert.match(error.message, /inline base64/);
+      return true;
+    });
   });
 
   it('refuses hard-linked files at check time', async (t) => {

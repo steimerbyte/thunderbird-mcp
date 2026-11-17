@@ -132,6 +132,10 @@ try {
     // No tags exist -- fall back to short hash
     buildVersion = execSync('git rev-parse --short HEAD', { cwd: PROJECT_DIR, encoding: 'utf8' }).trim();
   }
+  // The shipped version is the one in package.json. A version bump that is not
+  // yet committed or tagged cannot appear in git describe, so prefer the
+  // authoritative value there rather than stamping the previous release.
+  if (!buildVersion.startsWith(`v${packageVersion}`)) buildVersion = `v${packageVersion}`;
   // Append +dirty if there are uncommitted changes
   try {
     execSync('git diff --quiet && git diff --cached --quiet', { cwd: PROJECT_DIR });

@@ -63,6 +63,10 @@ function makeDirectSendAttachments() {
         calls.fileAccesses.push(["isFile", this.path]);
         return !directory;
       },
+      isReadable() {
+        calls.fileAccesses.push(["isReadable", this.path]);
+        return true;
+      },
       get fileSize() {
         calls.fileAccesses.push(["fileSize", this.path]);
         return calls.tempFiles.get(this.path)?.length ?? 6;

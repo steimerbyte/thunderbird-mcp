@@ -323,7 +323,9 @@ git clone https://github.com/TKasperczyk/thunderbird-mcp.git
 
 Install `dist/thunderbird-mcp.xpi` in Thunderbird (Tools > Add-ons > Install from File), then restart. A pre-built XPI is included in the repo -- no build step needed.
 
-**Automatic updates:** From v0.7.3 on, the add-on auto-updates through Thunderbird's add-on update check. Thunderbird downloads updates in the background and applies them on the next restart; because this add-on uses an experiment API, updates are not live hot-swapped. v0.7.3 is the last build you need to install by hand because older builds have no `update_url` and cannot auto-discover it. Thunderbird ships with `xpinstall.signatures.required=false`, so unsigned auto-updates work out of the box; a profile hardened to require signatures blocks both manual and automatic installs. If updates do not arrive, check the Add-ons gear menu and make sure **Update Add-ons Automatically** is enabled.
+**Automatic updates:** Upstream releases from v0.7.3 on auto-update through Thunderbird's add-on update check. Thunderbird downloads updates in the background and applies them on the next restart; because this add-on uses an experiment API, updates are not live hot-swapped. Thunderbird ships with `xpinstall.signatures.required=false`, so unsigned auto-updates work out of the box; a profile hardened to require signatures blocks both manual and automatic installs. If updates do not arrive, check the Add-ons gear menu and make sure **Update Add-ons Automatically** is enabled.
+
+This build carries **no `update_url`**. It is deployed by hand with local patches, and an `update_url` pointing at the upstream feed would let the auto-updater silently replace the patched build with an unpatched release. Without the key, installation and upgrades stay manual.
 
 ### 2. Configure your MCP client
 
@@ -390,13 +392,39 @@ That's it. Your AI can now access Thunderbird.
 
 ### Outgoing attachments
 
-For `sendMail`, `dryRunCompose`, `saveDraft`, `replyToMessage`, and `forwardMessage`, pass `attachments` as a JSON array, not a JSON-encoded string. The stdio bridge reads file-path attachments on the host and sends inline base64 to Thunderbird. The existing bridge limit is **18 MiB per path attachment**, now also applied to `saveDraft`. The extension's direct-HTTP path limit remains 50 MiB; inline base64 remains limited to 25 MiB of encoded data. Both transports enforce at most 20 attachments and 50 MiB of decoded attachments per operation.
+For `sendMail`, `dryRunCompose`, `saveDraft`, `replyToMessage`, and `forwardMessage`, pass `attachments` as a JSON array, not a JSON-encoded string. The stdio bridge reads file-path attachments on the host and sends inline base64 to Thunderbird. Both transports enforce at most 20 attachments and a per-file cap of **26,183,685 bytes**.
+
+Limits are measured against what the mail provider actually counts: **the whole stored message, not each decoded attachment**. Gmail advertises `250-SIZE 35882577` at EHLO and that number covers the base64 body, the 72-column MIME line-wrapping and the headers together. Measured exact on three server-stored messages:
+
+```
+stored(n) = 4*ceil(n/3) + 2*ceil(4*ceil(n/3)/72) + 1228
+```
+
+for decoded attachment bytes `n`, where 1228 is the constant header overhead, measured on a full-size probe send from a single identity with one attachment. So 18,500,000 bytes store as 25,352,938; 19,000,000 as 26,038,124; 19,500,000 as 26,723,308. Base64 inflates by 4/3 and wrapping adds ~2.6%, which is why the familiar "25 MB" is really **25 MiB of decoded content** and not the wire limit. The largest single attachment that fits is **26,183,685 bytes**: its base64 is 34,911,580 bytes, or 484,884 wrapped lines, and with headers that is 35,882,576 — one byte under Gmail's cap. One byte more overflows.
+
+The extension therefore gates the sum of all attachments on the same model (`MAX_STORED_MESSAGE_BYTES`, `getStoredAttachmentBytes`/`getStoredEncodedBytes` in `api.js`), and the single inline-base64 string is capped at **34,911,580 bytes** (`MAX_BASE64_SIZE`), the base64 length of that maximal attachment. `MAX_REQUEST_BODY` is 48 MiB so such an inline send survives the HTTP layer.
+
+Two encodings are charged differently on purpose: a **known-text** body (`text/*`, JSON, XML, JavaScript) may be quoted-printable at up to 3x, while every other body is base64 at 4/3. Charging 3x for binary over-estimated by ~2.25x and blocked sends far below the provider limit. Inline objects carry their encoded text already, so their exact length is used and never re-estimated.
+
+An unreviewed (`skipReview: true`) send is additionally checked against Thunderbird's `mailnews.message_warning_size` preference, which is a profile setting rather than something this add-on sets. The refusal names it so an operator can raise it or fall back to `skipReview: false`.
+
+#### Raising `mailnews.message_warning_size` for large unreviewed sends
+
+Raising the caps alone is not enough. Thunderbird's own guard (`mailnews.message_warning_size`, default 20,971,520) blocks any `skipReview` send whose conservative estimate exceeds it, and this add-on estimates a binary attachment as base64 (4/3) times 72-column wrapping times `COMPOSE_SIZE_MARGIN` 1.25 — about **1.716x the decoded size, not the stored bytes**. Measured: a 26,183,790-byte attachment estimates **44,927,792**, so a threshold just above Gmail's 35,882,577 (for example 36 MiB) still refuses every maximum-size send. The threshold must clear the estimate: 48 MiB (50,331,648) clears it with about 5.2 MB of headroom while the add-on's per-file gate stays binding.
+
+```js
+user_pref("mailnews.message_warning_size", 50331648);
+```
+
+Put that line in the profile's `user.js` and restart Thunderbird.
 
 For `dryRunCompose`, the extension inspects path metadata and inline base64 shape without decoding or materializing attachments. The stdio bridge still reads path attachments to inline them first; a refused path is a tool error rather than a report blocker. Disabling a tool does not prevent this pre-existing bridge path inspection. Hardening the bridge to consult tool availability before inspecting paths is outside this change.
 
 UNC/network and device paths, dotfiles and dot-directories, application-data directories (Windows `AppData` and the macOS home `Library`), and credential/key filenames are refused. Windows alternate data streams and path components ending in dots or spaces are also refused. Files exported by `getMessage(saveAttachments: true)` can still be attached again, and ordinary local document paths continue to work. If any attachment is refused, missing, invalid, or over a limit, the entire operation fails before sending, saving a draft, or opening a review window. The error identifies refused entries; temporary files created during the failed conversion are removed. Callers that previously relied on partial attachment success must handle this error explicitly.
 
 Files in hidden or application-data folders, including macOS `~/Library` and its cloud folders, must be copied to an ordinary folder before they can be attached by path.
+
+A path attachment is resolved in the server's own filesystem, not the caller's. A container or sandbox deployment therefore cannot see host paths outside its mounts: measured on a podman deployment that bind-mounts the Thunderbird profile at `/config`, a host path such as `/home/pi/workspace/report.pdf` does not exist inside the container and is refused with `not found`. Stage the file inside a directory the deployment mounts (`/config/tmp/`, or the profile's own directory) and pass that path, or send the bytes as an inline `{name, contentType, base64}` object, which never needs a shared filesystem. Refusals name the failing check: `not found`, `not a regular file`, `too large: <bytes> exceeds the 26183685 byte MAX_FILE_PATH_ATTACHMENT_BYTES limit`, `unreadable`, `sensitive path blocked`, or `not an absolute path`.
 
 External attachment links, including attachments removed with Thunderbird's **Detach** command and RSS/Atom feed enclosures, are refused by `getMessage` with `saveAttachments: true`, which reports "External attachment link refused" for the affected attachment. `includeInlineImages` also refuses them unless it can read a stored message part. A direct forward (`forwardMessage` with `skipReview: true`) is refused if the original includes one. Attachments stored in the message, including those from Exchange accounts, continue to work. A forward opened for review (`skipReview: false`) is built by Thunderbird and shows its attachments in the compose window.
 

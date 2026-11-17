@@ -1592,9 +1592,10 @@ RequestReader.prototype = {
         dumpn("_processHeaders, Content-length=" + this._contentLength);
 
         // Reject oversized request bodies before buffering into memory.
-        // 32 MB accommodates MAX_BASE64_SIZE (25 MB) inline attachments
-        // plus JSON-RPC framing overhead. Aligned with api.js MAX_REQUEST_BODY.
-        if (this._contentLength > 32 * 1024 * 1024) {
+        // 48 MB carries MAX_BASE64_SIZE (34911580, the base64 length of the
+        // largest attachment Gmail accepts) plus JSON-RPC framing overhead.
+        // Aligned with api.js MAX_REQUEST_BODY.
+        if (this._contentLength > 48 * 1024 * 1024) {
           throw HTTP_413;
         }
 

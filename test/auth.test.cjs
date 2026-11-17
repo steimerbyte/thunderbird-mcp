@@ -21,6 +21,7 @@ const { spawn } = require('child_process');
 const { makeAllowedTempDir } = require('./helpers/fixture-dir.cjs');
 
 const BRIDGE_PATH = path.resolve(__dirname, '..', 'mcp-bridge.cjs');
+const { attachmentLimits } = require('../mcp-bridge.cjs');
 let CONN_DIR;
 let CONN_FILE;
 let BRIDGE_ENV;
@@ -806,7 +807,7 @@ describe('Bridge attachment dispatch', () => {
     }
   });
 
-  it('inlines allowed saveDraft paths and applies the existing 18 MiB bridge limit', async () => {
+  it('inlines allowed saveDraft paths and applies the bridge per-file limit', async () => {
     const received = [];
     const server = http.createServer((req, res) => {
       let body = '';
@@ -828,7 +829,7 @@ describe('Bridge attachment dispatch', () => {
       assert.deepEqual(received[0].params.arguments.attachments, [{
         name: 'report.txt', contentType: 'text/plain', base64: Buffer.from('draft attachment').toString('base64'),
       }]);
-      fs.truncateSync(file, 18 * 1024 * 1024 + 1);
+      fs.truncateSync(file, attachmentLimits.MAX_ATTACHMENT_BYTES + 1);
       assert.match((await sendToBridge(message)).error.message, /Attachment too large/);
       assert.equal(received.length, 1);
     } finally {

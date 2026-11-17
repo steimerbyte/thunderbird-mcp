@@ -5,7 +5,7 @@ const assert = require("node:assert/strict");
 const { HTTPD_PORT, createHttpdHarness, installMcpHandler } = require("./helpers/httpd.cjs");
 
 const HEADER_LIMIT = 64 * 1024;
-const BODY_LIMIT = 32 * 1024 * 1024;
+const BODY_LIMIT = 48 * 1024 * 1024;
 const READ_SIZE = 8192;
 const HOST = `localhost:${HTTPD_PORT}`;
 
@@ -82,12 +82,13 @@ describe("httpd request framing over real Connection/Response/error pages", () =
     assertListening(harness);
   });
 
-  it("accepts exactly 32 MiB, waiting for the final byte", () => {
+  it("accepts exactly the body limit, waiting for the final byte", () => {
     const harness = createHttpdHarness();
     const exchange = harness.request(requestHead(`Content-Length: ${BODY_LIMIT}\r\n`));
     const block = "x".repeat(1024 * 1024);
-    for (let i = 0; i < 31; i++) exchange.feed(block);
-    exchange.feed(block.slice(1));
+    const fullBlocks = Math.floor((BODY_LIMIT - 1) / block.length);
+    for (let i = 0; i < fullBlocks; i++) exchange.feed(block);
+    exchange.feed(block.slice(0, BODY_LIMIT - 1 - fullBlocks * block.length));
     assert.equal(harness.requests.length, 0);
     assert.equal(exchange.wire, "");
     assert.equal(exchange.reader._contentLength, 1);
